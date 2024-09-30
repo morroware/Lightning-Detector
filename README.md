@@ -4,17 +4,17 @@
 
 ## Overview
 
-This project provides a Python script designed to run on a Raspberry Pi connected to an **AS3935 lightning sensor module**. It detects lightning strikes and sends notifications via **Slack** and **Twilio SMS** when lightning is detected within a specified distance threshold.
+This project provides a Python-based lightning detection system designed to run on a Raspberry Pi connected to an **AS3935 lightning sensor module**. The system detects lightning strikes and sends notifications via **Slack** and **Twilio SMS** when lightning is detected within a configurable distance.
 
-The script is extensively commented to help users who are unfamiliar with Python or this type of system understand how it works.
+The script is structured for easy use, with detailed comments to assist users who are unfamiliar with Python or lightning detection systems.
 
 ## Features
 
-- **Configurable Sensor Settings**: Adjust noise floor, watchdog threshold, and other sensor parameters.
-- **Flexible Notification System**: Send alerts through Slack and Twilio SMS with customizable messages.
-- **Modular Design**: Organized with classes and functions for easy maintenance and scalability.
-- **Robust Error Handling**: Includes logging and error checks for increased reliability.
-- **Secure Credentials Management**: Uses environment variables to handle sensitive information securely.
+- **Configurable Sensor Settings**: Customize sensor sensitivity, noise floor, and watchdog thresholds for optimal lightning detection.
+- **Flexible Notification System**: Send real-time alerts through Slack and Twilio SMS with customizable messages.
+- **Modular Codebase**: Organized into clear classes and functions for easy modification, expansion, and maintenance.
+- **Comprehensive Error Handling**: Includes robust logging and error checking to ensure reliability and troubleshooting support.
+- **Secure Credential Management**: Sensitive information such as API keys is stored securely using environment variables.
 
 ## Table of Contents
 
@@ -115,10 +115,8 @@ Reboot the Raspberry Pi for the changes to take effect:
 
 Clone the GitHub repository to your Raspberry Pi:
 
-    git clone https://github.com/yourusername/lightning-detection-system.git
-    cd lightning-detection-system
-
-*Replace `yourusername` with your GitHub username or the correct repository URL.*
+    git clone https://github.com/morroware/Lightning-Detector.git
+    cd Lightning-Detector
 
 ### 5. Install Python Dependencies
 
@@ -221,11 +219,11 @@ Create a `config.yaml` file in the project directory with the following content:
 
 Make sure the script is executable:
 
-    chmod +x lightning_detection.py
+    chmod +x Lightning-Detector.py
 
 Run the script:
 
-    python3 lightning_detection.py
+    python3 Lightning-Detector.py
 
 **Tip**: To keep the script running after logging out, consider using `screen`, `tmux`, or setting up a systemd service.
 
@@ -290,7 +288,7 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 
 ## Author
 
-- **Seth Morrow** - *Initial work* - [GitHub Profile](https://github.com/yourusername)
+- **Seth Morrow** - *Initial work* - [GitHub Profile](https://github.com/morroware)
 
 ---
 
