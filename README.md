@@ -1,295 +1,374 @@
-# Lightning Detection and Notification System using Raspberry Pi and AS3935 Sensor
+# Raspberry Pi Lightning Detector
 
-![Lightning Detection](https://your-image-url-here) <!-- Optional: Add an image related to the project -->
+A complete system for detecting lightning strikes using a Raspberry Pi Zero and CJMCU-339 AS3935 lightning sensor. Get notifications via Slack and SMS when lightning is detected in your area!
+
+## Table of Contents
+- [Overview](#overview)
+- [Hardware Requirements](#hardware-requirements)
+- [Hardware Setup](#hardware-setup)
+- [Software Setup](#software-setup)
+- [Configuration](#configuration)
+- [Running the System](#running-the-system)
+- [Troubleshooting](#troubleshooting)
+- [Maintenance](#maintenance)
 
 ## Overview
 
-This project provides a Python-based lightning detection system designed to run on a Raspberry Pi connected to an **AS3935 lightning sensor module**. The system detects lightning strikes and sends notifications via **Slack** and **Twilio SMS** when lightning is detected within a configurable distance.
-
-The script is structured for easy use, with detailed comments to assist users who are unfamiliar with Python or lightning detection systems.
-
-## Features
-
-- **Configurable Sensor Settings**: Customize sensor sensitivity, noise floor, and watchdog thresholds for optimal lightning detection.
-- **Flexible Notification System**: Send real-time alerts through Slack and Twilio SMS with customizable messages.
-- **Modular Codebase**: Organized into clear classes and functions for easy modification, expansion, and maintenance.
-- **Comprehensive Error Handling**: Includes robust logging and error checking to ensure reliability and troubleshooting support.
-- **Secure Credential Management**: Sensitive information such as API keys is stored securely using environment variables.
-
-## Table of Contents
-
-- [Hardware Requirements](#hardware-requirements)
-- [Software Requirements](#software-requirements)
-- [Hardware Setup](#hardware-setup)
-  - [1. Raspberry Pi Preparation](#1-raspberry-pi-preparation)
-  - [2. AS3935 Sensor Connection](#2-as3935-sensor-connection)
-- [Software Setup](#software-setup)
-  - [1. Update the Raspberry Pi](#1-update-the-raspberry-pi)
-  - [2. Install System Packages](#2-install-system-packages)
-  - [3. Enable I2C Interface](#3-enable-i2c-interface)
-  - [4. Clone the Repository](#4-clone-the-repository)
-  - [5. Install Python Dependencies](#5-install-python-dependencies)
-  - [6. Set Environment Variables](#6-set-environment-variables)
-  - [7. Create Configuration File](#7-create-configuration-file)
-- [Running the Script](#running-the-script)
-- [Configuration Details](#configuration-details)
-- [Troubleshooting](#troubleshooting)
-- [License](#license)
-- [Author](#author)
+This project creates a lightning detection system that can:
+- Detect lightning strikes up to 40km away
+- Estimate the distance to lightning strikes
+- Send notifications via Slack and SMS
+- Filter out false positives and noise
+- Run reliably 24/7
 
 ## Hardware Requirements
 
-- **Raspberry Pi** (any model with GPIO and I2C support)
-- **AS3935 Lightning Sensor Module**
-- **Breadboard and Jumper Wires** (for prototyping connections)
-- **Power Supply** for the Raspberry Pi
-- **Internet Connection** (for sending notifications)
+### Required Components
+1. Raspberry Pi Zero W (or any Raspberry Pi model)
+   - Cost: ~$10-15
+   - Where to buy: [Official Resellers](https://www.raspberrypi.com/resellers/)
 
-## Software Requirements
+2. CJMCU-339 AS3935 Lightning Sensor
+   - Cost: ~$10-20
+   - Where to buy: Amazon, AliExpress, etc.
 
-- **Raspberry Pi OS** (formerly Raspbian), preferably the latest version
-- **Python 3.x**
-- **Python Libraries**: Listed in [Install Python Dependencies](#5-install-python-dependencies)
+3. MicroSD Card (8GB or larger)
+   - Cost: ~$5-10
+   - Recommended: SanDisk or Samsung brand
+
+4. Power Supply for Raspberry Pi
+   - 5V 2.5A micro-USB power supply
+   - Cost: ~$8-10
+
+### Additional Components
+5. Jumper Wires (Female-to-Female)
+   - At least 6 wires needed
+   - Cost: ~$3-5
+
+6. Optional: Case for Raspberry Pi
+   - Cost: ~$5-10
+
+### Tools Needed
+- Small Phillips head screwdriver
+- Computer with SD card reader
+- Internet connection
+
+Total Budget: Approximately $45-70
 
 ## Hardware Setup
 
-### 1. Raspberry Pi Preparation
+### Step 1: Prepare the Raspberry Pi
 
-Ensure your Raspberry Pi is powered off before making any hardware connections to prevent damage.
+1. Insert the MicroSD card into your computer
+2. Download the Raspberry Pi Imager:
+   - Visit: https://www.raspberrypi.com/software/
+   - Download and install for your operating system
 
-### 2. AS3935 Sensor Connection
+3. Install Raspberry Pi OS:
+   - Launch Raspberry Pi Imager
+   - Choose OS: "Raspberry Pi OS (32-bit) Lite" (no desktop needed)
+   - Choose Storage: Select your MicroSD card
+   - Click "Write"
 
-The AS3935 sensor communicates using the **I2C** protocol. Below is the wiring guide to connect the sensor to the Raspberry Pi using **BCM (Broadcom SOC channel) numbering**.
+4. Enable SSH and WiFi (before ejecting SD card):
+   - Create empty file named `ssh` in boot partition
+   - Create `wpa_supplicant.conf` in boot partition:
+   ```
+   country=US
+   ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
+   network={
+       ssid="YOUR_WIFI_NAME"
+       psk="YOUR_WIFI_PASSWORD"
+       key_mgmt=WPA-PSK
+   }
+   ```
 
-#### Pin Connections
+### Step 2: Wire the AS3935 Sensor
 
-| **AS3935 Sensor Pin** | **Raspberry Pi Pin (BCM)** | **Description** |
-|-----------------------|----------------------------|-----------------|
-| VCC                   | 3.3V (Pin 1)               | Power           |
-| GND                   | GND (Pin 6)                | Ground          |
-| SDA                   | SDA (GPIO 2, Pin 3)        | I2C Data        |
-| SCL                   | SCL (GPIO 3, Pin 5)        | I2C Clock       |
-| IRQ                   | GPIO 4 (Pin 7)             | Interrupt       |
+Connect the CJMCU-339 to Raspberry Pi using jumper wires:
 
-#### Steps
+| AS3935 Pin | Raspberry Pi Pin | Description |
+|------------|------------------|-------------|
+| VDD        | Pin 1 (3.3V)    | Power       |
+| GND        | Pin 6 (GND)     | Ground      |
+| SCL        | Pin 5 (SCL)     | I2C Clock   |
+| SDA        | Pin 3 (SDA)     | I2C Data    |
+| IRQ        | Pin 7 (GPIO4)   | Interrupt   |
+| EN_V       | Pin 1 (3.3V)    | Enable      |
 
-1. **Connect Power**: Connect the **VCC** pin on the sensor to the **3.3V** pin on the Raspberry Pi.
-2. **Connect Ground**: Connect the **GND** pin on the sensor to a **GND** pin on the Raspberry Pi.
-3. **Connect I2C Data Line**: Connect the **SDA** pin on the sensor to the **SDA** (GPIO 2) pin on the Raspberry Pi.
-4. **Connect I2C Clock Line**: Connect the **SCL** pin on the sensor to the **SCL** (GPIO 3) pin on the Raspberry Pi.
-5. **Connect Interrupt Line**: Connect the **IRQ** pin on the sensor to **GPIO 4** on the Raspberry Pi.
+![Wiring Diagram](wiring_diagram.png)
 
-**Note**: The GPIO pin numbers refer to the BCM numbering scheme used in the script. Ensure that the `gpio_mode` in the configuration is set to `BCM`.
+WARNING: Double-check all connections before powering on! Incorrect wiring can damage your devices.
+
+### Step 3: Power Up
+
+1. Insert the MicroSD card into Raspberry Pi
+2. Connect the power supply
+3. Wait 1-2 minutes for boot
 
 ## Software Setup
 
-### 1. Update the Raspberry Pi
+### Step 1: Connect to Raspberry Pi
 
-Before installing any software, update your package lists and upgrade existing packages:
+1. Find your Pi's IP address:
+   - Check your router's DHCP client list, or
+   - Use a network scanner like "Advanced IP Scanner"
 
-    sudo apt update
-    sudo apt upgrade -y
+2. Connect via SSH:
+   ```bash
+   ssh pi@YOUR_PI_IP_ADDRESS
+   # Default password: raspberry
+   ```
 
-### 2. Install System Packages
+3. Change default password:
+   ```bash
+   passwd
+   ```
 
-Install essential system packages required for I2C communication and Python development:
+### Step 2: System Configuration
 
-    sudo apt install -y python3 python3-pip python3-dev i2c-tools
+1. Update system:
+   ```bash
+   sudo apt update
+   sudo apt upgrade -y
+   ```
 
-### 3. Enable I2C Interface
+2. Enable I2C:
+   ```bash
+   sudo raspi-config
+   # Navigate to: Interface Options > I2C > Enable
+   ```
 
-Enable the I2C interface to allow communication with the sensor:
+3. Install required packages:
+   ```bash
+   sudo apt install -y python3-pip python3-smbus i2c-tools git
+   ```
 
-    sudo raspi-config
+4. Verify I2C connection:
+   ```bash
+   sudo i2cdetect -y 1
+   # Should show device at address 0x03
+   ```
 
-- Navigate to **Interfacing Options**.
-- Select **I2C** and enable it.
+### Step 3: Install Python Dependencies
 
-Alternatively, you can add `dtparam=i2c_arm=on` to `/boot/config.txt`.
+```bash
+pip3 install smbus2 RPi.GPIO slack_sdk twilio
+```
 
-Reboot the Raspberry Pi for the changes to take effect:
+### Step 4: Download Project Code
 
-    sudo reboot
+```bash
+git clone https://github.com/yourusername/lightning-detector.git
+cd lightning-detector
+```
 
-### 4. Clone the Repository
+## Configuration
 
-Clone the GitHub repository to your Raspberry Pi:
+### Step 1: Set Up External Services
 
-    git clone https://github.com/morroware/Lightning-Detector.git
-    cd Lightning-Detector
+1. Slack Setup:
+   - Create new Slack workspace or use existing
+   - Create new Slack App: https://api.slack.com/apps
+   - Add Bot Token Scopes: `chat:write`
+   - Install app to workspace
+   - Copy Bot User OAuth Token
 
-### 5. Install Python Dependencies
+2. Twilio Setup:
+   - Create Twilio account: https://www.twilio.com/try-twilio
+   - Get Account SID and Auth Token
+   - Get or buy a phone number
 
-Install the required Python libraries using `pip3`:
+### Step 2: Configure the Application
 
-    pip3 install smbus2 RPi.GPIO pyyaml slack_sdk twilio logging
+1. Create configuration file:
+   ```bash
+   cp config.ini.example config.ini
+   nano config.ini
+   ```
 
-Alternatively, if a `requirements.txt` file is provided:
+2. Edit configuration:
+   ```ini
+   [Slack]
+   bot_token = xoxb-your-slack-bot-token
+   channel = #your-channel
 
-    pip3 install -r requirements.txt
+   [Twilio]
+   account_sid = your-twilio-account-sid
+   auth_token = your-twilio-auth-token
+   from_number = +1234567890
+   to_number = +0987654321
 
-### 6. Set Environment Variables
+   [Sensor]
+   i2c_bus_number = 1
+   as3935_i2c_addr = 0x03
+   irq_pin = 4
+   ```
 
-The script uses environment variables to securely handle sensitive credentials.
+## Running the System
 
-#### Slack API Token
+### Start the Detector
 
-Set your Slack API token:
+1. Run manually:
+   ```bash
+   python3 lightning-detector.py
+   ```
 
-    export SLACK_API_TOKEN='your-slack-api-token'
+2. Run as service:
+   ```bash
+   sudo nano /etc/systemd/system/lightning-detector.service
+   ```
+   
+   Add content:
+   ```ini
+   [Unit]
+   Description=Lightning Detector Service
+   After=network.target
 
-#### Twilio Credentials
+   [Service]
+   ExecStart=/usr/bin/python3 /home/pi/lightning-detector/lightning-detector.py
+   WorkingDirectory=/home/pi/lightning-detector
+   StandardOutput=inherit
+   StandardError=inherit
+   Restart=always
+   User=pi
 
-Set your Twilio Account SID and Auth Token:
+   [Install]
+   WantedBy=multi-user.target
+   ```
 
-    export TWILIO_ACCOUNT_SID='your-twilio-account-sid'
-    export TWILIO_AUTH_TOKEN='your-twilio-auth-token'
+3. Enable and start service:
+   ```bash
+   sudo systemctl enable lightning-detector
+   sudo systemctl start lightning-detector
+   ```
 
-**Optional**: Add these lines to your `~/.bashrc` or `~/.profile` to set them automatically on login.
+### Monitor the System
 
-### 7. Create Configuration File
+1. Check service status:
+   ```bash
+   sudo systemctl status lightning-detector
+   ```
 
-Create a `config.yaml` file in the project directory with the following content:
-
-    # config.yaml
-
-    sensor:
-      noise_floor: 2
-      watchdog_threshold: 2
-      reset_register: 0x3C
-      reset_command: 0x96
-      noise_floor_register: 0x01
-      watchdog_threshold_register: 0x01
-      interrupt_register: 0x03
-      distance_register: 0x07
-      noise_level_bit: 0x01
-      disturber_bit: 0x04
-      lightning_bit: 0x08
-
-    hardware:
-      i2c_bus: 1
-      sensor_address: 0x03
-      interrupt_pin: 4
-      gpio_mode: BCM
-
-    timing:
-      sensor_reset_delay: 0.1
-      interrupt_handling_delay: 0.003
-      main_loop_sleep_duration: 1
-      gpio_bouncetime: 500
-
-    notifications:
-      slack:
-        enabled: true
-        channel_id: 'your-slack-channel-id'
-        api_token_env_var: SLACK_API_TOKEN
-
-      twilio:
-        enabled: true
-        from_number: '+1234567890'
-        to_number: '+0987654321'
-        account_sid_env_var: TWILIO_ACCOUNT_SID
-        auth_token_env_var: TWILIO_AUTH_TOKEN
-
-      threading:
-        enabled: true
-        timeout: null
-
-      message_templates:
-        lightning_detected: "⚡ Lightning detected approximately {distance} km away!"
-        noise_too_high: "Warning: Noise level too high."
-        disturber_detected: "Info: Disturber detected (false event)."
-
-    user_settings:
-      alert_threshold: 40
-
-    logging:
-      level: INFO
-      format: '%(asctime)s - %(levelname)s - %(message)s'
-      file: '/var/log/lightning_detection.log'
-
-**Notes**:
-
-- Replace `'your-slack-channel-id'` with your actual Slack channel ID.
-- Replace the Twilio phone numbers with your Twilio number and the recipient's number.
-- Adjust the `alert_threshold` to your desired maximum distance for notifications.
-- Ensure the logging file path is writable by the user running the script.
-
-## Running the Script
-
-Make sure the script is executable:
-
-    chmod +x Lightning-Detector.py
-
-Run the script:
-
-    python3 Lightning-Detector.py
-
-**Tip**: To keep the script running after logging out, consider using `screen`, `tmux`, or setting up a systemd service.
-
-## Configuration Details
-
-The `config.yaml` file allows you to customize the behavior of the system.
-
-### Sensor Settings
-
-- **noise_floor**: Adjusts the sensor's sensitivity to environmental noise (0-7).
-- **watchdog_threshold**: Sets the threshold for signal validation (0-10).
-
-### Hardware Settings
-
-- **i2c_bus**: The I2C bus number (usually `1` for newer Raspberry Pi models).
-- **sensor_address**: The I2C address of the AS3935 sensor.
-- **interrupt_pin**: The GPIO pin connected to the sensor's IRQ pin.
-- **gpio_mode**: GPIO numbering mode (`BCM` or `BOARD`).
-
-### Notification Settings
-
-- **Slack**:
-  - **enabled**: Set to `true` to enable Slack notifications.
-  - **channel_id**: The ID of the Slack channel to send messages to.
-  - **api_token_env_var**: Environment variable name storing the Slack API token.
-- **Twilio**:
-  - **enabled**: Set to `true` to enable Twilio SMS notifications.
-  - **from_number**: Your Twilio phone number.
-  - **to_number**: Recipient's phone number.
-  - **account_sid_env_var**: Environment variable name for Twilio Account SID.
-  - **auth_token_env_var**: Environment variable name for Twilio Auth Token.
-
-### User Settings
-
-- **alert_threshold**: Maximum distance (in km) for sending alerts.
-
-### Logging
-
-- **level**: Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`).
-- **format**: Format of log messages.
-- **file**: File path to save logs.
+2. View logs:
+   ```bash
+   tail -f lightning_detector.log
+   ```
 
 ## Troubleshooting
 
 ### Common Issues
 
-- **I2C Device Not Found**: Run `i2cdetect -y 1` to check if the sensor is detected.
-- **Permission Denied**: Ensure the script has execution permissions and access to necessary resources.
-- **Environment Variables Not Set**: Verify that Slack and Twilio environment variables are correctly set.
+1. **Sensor Not Detected**
+   - Check wiring connections
+   - Verify I2C is enabled: `sudo raspi-config`
+   - Check I2C address: `sudo i2cdetect -y 1`
+   - Verify power supply is adequate
 
-### Logs
+2. **No Notifications**
+   - Check internet connection
+   - Verify Slack/Twilio credentials
+   - Check logs for errors
+   - Ensure correct channel/phone numbers
 
-Check the log file specified in the configuration (e.g., `/var/log/lightning_detection.log`) for detailed error messages.
+3. **False Positives**
+   - Place sensor away from electrical interference
+   - Adjust noise floor level in code
+   - Keep wires short and away from power sources
 
-### Sensor Calibration
+4. **System Crashes**
+   - Check power supply stability
+   - Monitor CPU temperature: `vcgencmd measure_temp`
+   - Check available memory: `free -h`
+   - Review logs for errors
 
-You may need to adjust the `noise_floor` and `watchdog_threshold` settings to suit your environment.
+### Debug Commands
+
+```bash
+# Check system logs
+journalctl -u lightning-detector
+
+# Test I2C connection
+i2cget -y 1 0x03 0x00
+
+# Monitor CPU usage
+top
+
+# Check network connectivity
+ping 8.8.8.8
+```
+
+## Maintenance
+
+### Regular Tasks
+
+1. Weekly:
+   - Check log files
+   - Verify notifications working
+   - Monitor system temperature
+
+2. Monthly:
+   - Update system packages
+   ```bash
+   sudo apt update
+   sudo apt upgrade -y
+   ```
+   - Check for project updates
+   ```bash
+   cd lightning-detector
+   git pull
+   ```
+
+3. As Needed:
+   - Clean dust from hardware
+   - Check wire connections
+   - Rotate log files
+   - Update configuration
+
+### Backup System
+
+1. Back up configuration:
+   ```bash
+   cp config.ini config.ini.backup
+   ```
+
+2. Back up SD card (from another computer):
+   - Use Raspberry Pi Imager
+   - Choose "Custom" > "Backup"
+   - Select your Pi's SD card
+   - Save the image file
+
+## Performance Tuning
+
+### Reducing False Positives
+
+1. Adjust noise floor level in code
+2. Place sensor in optimal location:
+   - Away from electronics
+   - Away from metal objects
+   - Higher elevation preferred
+
+3. Modify sensitivity settings:
+   - Edit `AFE_GB_INDOOR` value
+   - Adjust `INTERRUPT_COOLDOWN_SECONDS`
+
+### Improving Reliability
+
+1. Use high-quality power supply
+2. Add UPS backup power
+3. Monitor system resources
+4. Implement watchdog timer
+
+## Contributing
+
+Found a bug or want to contribute? Please open an issue or submit a pull request!
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the LICENSE file for details.
 
-## Author
+## Acknowledgments
 
-- **Seth Morrow** - *Initial work* - [GitHub Profile](https://github.com/morroware)
-
----
-
-*Feel free to contribute to this project by opening issues or submitting pull requests.*
+- AMS AS3935 Franklin Lightning Sensor
+- Raspberry Pi Foundation
+- Open-source community
