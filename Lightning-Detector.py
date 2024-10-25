@@ -1,603 +1,647 @@
+#!/usr/bin/env python3
 """
-Lightning Detection and Notification System using Raspberry Pi and AS3935 Sensor
-Author: Seth Morrow
-Date: 9/25/24
-
-Description:
-This script is designed to run on a Raspberry Pi connected to an AS3935 lightning sensor module.
-It detects lightning strikes and sends notifications via Slack and Twilio SMS when lightning is detected
-within a specified distance threshold.
-
-The script is extensively commented to help users who are unfamiliar with Python or this type of system
-understand how it works.
-
-Features:
-- Configurable sensor settings (noise floor, watchdog threshold)
-- Configurable notification settings (Slack, Twilio SMS)
-- Modular design with classes and functions for maintainability
-- Error handling and logging for reliability
-- Secure handling of sensitive credentials using environment variables
+Lightning Detector Script for Raspberry Pi Zero using CJMCU-339 AS3935 Sensor.
+Sends alerts via Slack and SMS using Twilio when lightning is detected.
 """
 
-# ==============================
-# Import Necessary Libraries
-# ==============================
+# Import standard Python modules
+import os
+import time
+import signal
+import logging
+import logging.handlers
+import threading
+import queue
+import traceback
+from datetime import datetime, timedelta
+import configparser  # Module to read configurations from a file
 
-import time  # Provides time-related functions, such as sleep for delays
-import RPi.GPIO as GPIO  # Allows interaction with the Raspberry Pi's GPIO pins
-from smbus2 import SMBus  # Enables communication over the I2C bus (for the sensor)
-import yaml  # Used to read configuration settings from a YAML file
-from slack_sdk import WebClient  # Slack SDK for sending messages to Slack channels
-from twilio.rest import Client  # Twilio SDK for sending SMS messages
-import logging  # Provides logging capabilities to track events and errors
-import threading  # Allows for concurrent execution and handling program termination
-import os  # Provides a way to access environment variables for secure credentials
-import sys  # Used for system-specific parameters and functions
+# Import third-party modules
+import smbus2  # For I2C communication
+import RPi.GPIO as GPIO  # For GPIO pin control on Raspberry Pi
+from slack_sdk import WebClient  # Slack client to send messages
+from slack_sdk.errors import SlackApiError  # For handling Slack API errors
+from twilio.rest import Client as TwilioClient  # Twilio client to send SMS
+from twilio.base.exceptions import TwilioRestException  # For handling Twilio errors
 
-# ==============================
-# Configuration Loading Module
-# ==============================
+# ----------------------------
+# Constants and Configuration
+# ----------------------------
 
-def load_config(config_path='config.yaml'):
-    """
-    Load the configuration from a YAML file.
+# Constants for AS3935 Register Addresses (as per datasheet)
+REG_AFE_GAIN = 0x00            # Register for AFE gain settings
+REG_INT_MASK_ANT = 0x03        # Register for interrupt mask and antenna tuning
+REG_LIGHTNING_DISTANCE = 0x07  # Register that holds the estimated lightning distance
+REG_INT = 0x03                 # Register that holds the interrupt source
+REG_NOISE_FLOOR = 0x01         # Register for noise floor level settings
 
-    :param config_path: Path to the YAML configuration file.
-    :return: Parsed configuration as a Python dictionary.
-    """
-    try:
-        with open(config_path, 'r') as config_file:
-            config = yaml.safe_load(config_file)
-            logging.debug("Configuration loaded successfully from '%s'.", config_path)
-            return config
-    except FileNotFoundError:
-        logging.error("Configuration file '%s' not found.", config_path)
-        sys.exit(1)
-    except yaml.YAMLError as e:
-        logging.error("Error parsing the configuration file: %s", e)
-        sys.exit(1)
+# Bit Masks for interpreting register values
+MASK_DISTURBER = 0x20          # Mask for disturber events
+MASK_LIGHTNING = 0x08          # Mask for lightning detection events
+MASK_DISTURBER_EVENT = 0x04    # Mask for disturber detection events
+MASK_NOISE_HIGH = 0x01         # Mask for high noise level events
 
-def validate_config(config):
-    """
-    Validate the configuration parameters to ensure all required settings are present.
+# Constants for AFE (Analog Front End) Gain settings
+AFE_GB_INDOOR = 0x12           # Gain value for indoor settings
+AFE_GB_OUTDOOR = 0x0E          # Gain value for outdoor settings
 
-    This function checks for the presence of critical configuration entries and exits the program
-    if any are missing.
+# Debounce Configuration to prevent multiple rapid interrupts
+INTERRUPT_COOLDOWN_SECONDS = 1  # Time in seconds to wait before processing another interrupt
 
-    :param config: Configuration dictionary to validate.
-    """
-    # Retrieve the list of required configurations from the config file or use defaults
-    required_configs = config.get('required_configs', [
-        # Sensor settings
-        ('sensor', 'noise_floor'),
-        ('sensor', 'watchdog_threshold'),
-        ('sensor', 'reset_register'),
-        ('sensor', 'reset_command'),
-        ('sensor', 'noise_floor_register'),
-        ('sensor', 'watchdog_threshold_register'),
-        ('sensor', 'interrupt_register'),
-        ('sensor', 'distance_register'),
-        ('sensor', 'noise_level_bit'),
-        ('sensor', 'disturber_bit'),
-        ('sensor', 'lightning_bit'),
-
-        # Hardware settings
-        ('hardware', 'i2c_bus'),
-        ('hardware', 'sensor_address'),
-        ('hardware', 'interrupt_pin'),
-        ('hardware', 'gpio_mode'),
-
-        # Timing settings
-        ('timing', 'sensor_reset_delay'),
-        ('timing', 'interrupt_handling_delay'),
-        ('timing', 'main_loop_sleep_duration'),
-        ('timing', 'gpio_bouncetime'),
-
-        # Notifications settings
-        ('notifications', 'message_templates', 'lightning_detected'),
-        ('notifications', 'message_templates', 'noise_too_high'),
-        ('notifications', 'message_templates', 'disturber_detected'),
-        ('notifications', 'threading', 'enabled'),
-        ('notifications', 'threading', 'timeout'),
-
-        # User settings
-        ('user_settings', 'alert_threshold'),
-    ])
-
-    # Check for required configurations
-    for keys in required_configs:
-        conf = config
-        for key in keys:
-            if key not in conf:
-                logging.error("Configuration parameter '%s' is missing.", '.'.join(keys))
-                sys.exit(1)
-            conf = conf[key]
-
-    # Additional checks based on enabled notifications
-    if config['notifications']['slack']['enabled']:
-        slack_required = [
-            ('notifications', 'slack', 'channel_id'),
-            ('notifications', 'slack', 'api_token_env_var'),
-        ]
-        for keys in slack_required:
-            conf = config
-            for key in keys:
-                if key not in conf:
-                    logging.error("Configuration parameter '%s' is missing.", '.'.join(keys))
-                    sys.exit(1)
-                conf = conf[key]
-
-    if config['notifications']['twilio']['enabled']:
-        twilio_required = [
-            ('notifications', 'twilio', 'from_number'),
-            ('notifications', 'twilio', 'to_number'),
-            ('notifications', 'twilio', 'account_sid_env_var'),
-            ('notifications', 'twilio', 'auth_token_env_var'),
-        ]
-        for keys in twilio_required:
-            conf = config
-            for key in keys:
-                if key not in conf:
-                    logging.error("Configuration parameter '%s' is missing.", '.'.join(keys))
-                    sys.exit(1)
-                conf = conf[key]
-
-# ==============================
+# ----------------------------
 # Logging Configuration
-# ==============================
+# ----------------------------
 
-def configure_logging(config):
+# Configure logging with rotation to handle log file sizes
+LOG_FILENAME = 'lightning_detector.log'
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)  # Set the logging level to INFO
+
+# Create a rotating file handler to manage log files
+handler = logging.handlers.RotatingFileHandler(
+    LOG_FILENAME, maxBytes=5*1024*1024, backupCount=5)  # Rotate logs at 5 MB, keep 5 backups
+
+# Define the format for log messages
+formatter = logging.Formatter(
+    '[%(asctime)s] %(levelname)s:%(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S')
+
+# Apply the formatter to the handler and add the handler to the logger
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+# ----------------------------
+# Configuration File Loading
+# ----------------------------
+
+# Create a ConfigParser object to read the configuration file
+config = configparser.ConfigParser()
+
+# Read the configuration file 'config.ini' located in the same directory
+config.read('config.ini')
+
+def get_config_value(section, option, default=None, required=False):
     """
-    Configure the logging settings based on the configuration.
+    Retrieves a configuration value from the config.ini file.
 
-    :param config: Configuration dictionary containing logging settings.
+    Args:
+        section (str): The section in the config file (e.g., 'Slack').
+        option (str): The option key within the section (e.g., 'bot_token').
+        default: The default value to return if the option is not found.
+        required (bool): If True, raises an error if the option is not found.
+
+    Returns:
+        The value of the configuration option.
+
+    Raises:
+        ValueError: If the required option is not found in the config file.
     """
-    logging_config = config.get('logging', {})
-    logging_format = logging_config.get('format', '%(asctime)s - %(levelname)s - %(message)s')
-    logging_level_name = logging_config.get('level', 'INFO').upper()
-    logging_level = getattr(logging, logging_level_name, logging.INFO)
-    log_file = logging_config.get('file')
-
-    if log_file:
-        logging.basicConfig(filename=log_file, format=logging_format, level=logging_level)
+    if config.has_option(section, option):
+        return config.get(section, option)
+    elif default is not None:
+        return default
+    elif required:
+        logger.error(f"Configuration option '{option}' in section '{section}' is required but not set.")
+        raise ValueError(f"Configuration option '{option}' in section '{section}' is required but not set.")
     else:
-        logging.basicConfig(format=logging_format, level=logging_level)
+        return None
 
-    logging.debug("Logging configured with level '%s', format '%s', and file '%s'.",
-                  logging_level_name, logging_format, log_file)
-
-# ==============================
-# Notification Initialization
-# ==============================
-
-def initialize_notifications(config):
+def parse_i2c_address(addr_str):
     """
-    Initialize notification clients based on the configuration.
+    Parses the I2C address string and converts it to an integer.
 
-    :param config: Configuration dictionary containing notification settings.
-    :return: Tuple of (slack_client, twilio_client)
+    Args:
+        addr_str (str): The I2C address as a string (e.g., '0x03').
+
+    Returns:
+        int: The I2C address as an integer.
+
+    Raises:
+        ValueError: If the address string is invalid.
     """
-    slack_client = None
-    twilio_client = None
+    try:
+        return int(addr_str, 0)  # The '0' base allows for automatic base detection (hex, dec, octal)
+    except ValueError:
+        raise ValueError(f"Invalid I2C address format: {addr_str}")
 
-    # Slack notification setup
-    if config['notifications']['slack']['enabled']:
-        slack_env_var = config['notifications']['slack'].get('api_token_env_var', 'SLACK_API_TOKEN')
-        slack_api_token = os.environ.get(slack_env_var)
-        if not slack_api_token:
-            logging.error("Slack API token not found in environment variable '%s'.", slack_env_var)
-            sys.exit(1)
-        try:
-            slack_client = WebClient(token=slack_api_token)
-            logging.debug("Slack client initialized successfully.")
-        except Exception as e:
-            logging.error("Failed to initialize Slack client: %s", e)
-            slack_client = None
+# ----------------------------
+# Load and Validate Configurations
+# ----------------------------
 
-    # Twilio SMS notification setup
-    if config['notifications']['twilio']['enabled']:
-        twilio_sid_env_var = config['notifications']['twilio'].get('account_sid_env_var', 'TWILIO_ACCOUNT_SID')
-        twilio_token_env_var = config['notifications']['twilio'].get('auth_token_env_var', 'TWILIO_AUTH_TOKEN')
-        twilio_account_sid = os.environ.get(twilio_sid_env_var)
-        twilio_auth_token = os.environ.get(twilio_token_env_var)
-        if not twilio_account_sid or not twilio_auth_token:
-            logging.error("Twilio credentials not found in environment variables '%s' and '%s'.",
-                          twilio_sid_env_var, twilio_token_env_var)
-            sys.exit(1)
-        try:
-            twilio_client = Client(twilio_account_sid, twilio_auth_token)
-            logging.debug("Twilio client initialized successfully.")
-        except Exception as e:
-            logging.error("Failed to initialize Twilio client: %s", e)
-            twilio_client = None
+try:
+    # Load Slack configurations
+    SLACK_BOT_TOKEN = get_config_value('Slack', 'bot_token', required=True)
+    SLACK_CHANNEL = get_config_value('Slack', 'channel', required=True)
 
-    return slack_client, twilio_client
+    # Load Twilio configurations
+    TWILIO_ACCOUNT_SID = get_config_value('Twilio', 'account_sid', required=True)
+    TWILIO_AUTH_TOKEN = get_config_value('Twilio', 'auth_token', required=True)
+    TWILIO_FROM_NUMBER = get_config_value('Twilio', 'from_number', required=True)
+    TWILIO_TO_NUMBER = get_config_value('Twilio', 'to_number', required=True)
 
-# ==============================
-# Sensor Interaction Class
-# ==============================
+    # Load Sensor configurations
+    I2C_BUS_NUMBER = int(get_config_value('Sensor', 'i2c_bus_number', '1'))
+    AS3935_I2C_ADDR = parse_i2c_address(get_config_value('Sensor', 'as3935_i2c_addr', '0x03'))
+    IRQ_PIN = int(get_config_value('Sensor', 'irq_pin', '4'))
 
-class LightningSensor:
+    # Validate I2C address range (valid addresses for I2C devices)
+    if not (0x03 <= AS3935_I2C_ADDR <= 0x77):
+        raise ValueError(f"I2C address {AS3935_I2C_ADDR:#04x} is out of valid range (0x03 to 0x77).")
+
+    # Validate GPIO pin number range (valid GPIO pins on Raspberry Pi)
+    if not (2 <= IRQ_PIN <= 27):
+        raise ValueError(f"GPIO pin {IRQ_PIN} is out of valid range (2 to 27).")
+
+except ValueError as e:
+    # Log the error and exit if configuration is invalid
+    logger.error(e)
+    exit(1)
+
+# ----------------------------
+# Initialize Clients
+# ----------------------------
+
+# Initialize the Slack client with the provided bot token
+slack_client = WebClient(token=SLACK_BOT_TOKEN)
+
+# Initialize the Twilio client with the provided credentials
+twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# ----------------------------
+# LightningDetector Class Definition
+# ----------------------------
+
+class LightningDetector:
     """
-    Class to interact with the AS3935 lightning sensor.
-
-    This class provides methods to initialize the sensor, read interrupts, and get distance estimates.
+    Class to handle the lightning detection logic.
+    This class encapsulates all functionality related to the AS3935 sensor,
+    event processing, alert sending, and graceful shutdown.
     """
 
-    def __init__(self, bus, address, config):
+    def __init__(self):
         """
-        Initialize the LightningSensor object with the I2C bus, sensor address, and configuration.
-
-        :param bus: An SMBus object representing the I2C bus.
-        :param address: The I2C address of the sensor.
-        :param config: Configuration dictionary.
+        Initializes the LightningDetector instance by setting up the I2C bus,
+        GPIO pins, and various synchronization primitives.
         """
-        self.bus = bus
-        self.address = address
-        self.config = config
+        # Initialize a lock for synchronized access to the I2C bus
+        self.i2c_lock = threading.Lock()
 
-    def setup(self, noise_floor, watchdog_threshold, reset_delay=0.1):
-        """
-        Set up the sensor with initial configuration.
+        # Initialize a lock for synchronized access to interrupt handling
+        self.interrupt_lock = threading.Lock()
 
-        This method resets the sensor to default settings and configures specific parameters
-        such as the noise floor level and watchdog threshold based on the configuration.
-
-        :param noise_floor: Noise floor level (0-7).
-        :param watchdog_threshold: Watchdog threshold (0-15).
-        :param reset_delay: Delay after sensor reset in seconds.
-        """
+        # Initialize the I2C bus using the bus number from the configuration
         try:
-            # Retrieve sensor register addresses and commands from config
-            reset_register = self.config['sensor'].get('reset_register', 0x3C)
-            reset_command = self.config['sensor'].get('reset_command', 0x96)
-            noise_floor_register = self.config['sensor'].get('noise_floor_register', 0x01)
-            watchdog_threshold_register = self.config['sensor'].get('watchdog_threshold_register', 0x01)
-
-            # Reset the sensor to default settings
-            self.bus.write_byte_data(self.address, reset_register, reset_command)
-            logging.debug("Sensor reset command sent to register 0x%02X with command 0x%02X.", reset_register, reset_command)
-            # Wait for the specified reset delay
-            time.sleep(reset_delay)
-
-            # Configure the noise floor level
-            noise_floor = noise_floor & 0x07  # Ensure it is a 3-bit value
-            reg_value = self.bus.read_byte_data(self.address, noise_floor_register)
-            reg_value = (reg_value & 0xF8) | noise_floor
-            self.bus.write_byte_data(self.address, noise_floor_register, reg_value)
-            logging.debug("Noise floor set to %d.", noise_floor)
-
-            # Configure the watchdog threshold
-            watchdog_threshold = watchdog_threshold & 0x0F  # Ensure it is a 4-bit value
-            reg_value = self.bus.read_byte_data(self.address, watchdog_threshold_register)
-            reg_value = (reg_value & 0x0F) | (watchdog_threshold << 4)
-            self.bus.write_byte_data(self.address, watchdog_threshold_register, reg_value)
-            logging.debug("Watchdog threshold set to %d.", watchdog_threshold)
-
-            # Configure additional sensor settings if provided
-            frequency_division_ratio = self.config['sensor'].get('frequency_division_ratio')
-            if frequency_division_ratio is not None:
-                # Set frequency division ratio (Example: Register 0x02)
-                frequency_register = self.config['sensor'].get('frequency_division_register', 0x02)
-                self.bus.write_byte_data(self.address, frequency_register, frequency_division_ratio)
-                logging.debug("Frequency division ratio set to %d.", frequency_division_ratio)
-
-            spike_rejection = self.config['sensor'].get('spike_rejection')
-            if spike_rejection is not None:
-                # Set spike rejection (Example: Register 0x02)
-                spike_rejection_register = self.config['sensor'].get('spike_rejection_register', 0x02)
-                self.bus.write_byte_data(self.address, spike_rejection_register, spike_rejection)
-                logging.debug("Spike rejection set to %d.", spike_rejection)
-
-            # Log an informational message indicating successful sensor initialization
-            logging.info("Sensor initialized with noise_floor=%d, watchdog_threshold=%d",
-                         noise_floor, watchdog_threshold)
+            self.bus = smbus2.SMBus(I2C_BUS_NUMBER)
+            logger.info("I2C bus initialized.")
+        except FileNotFoundError:
+            logger.error("I2C bus not found. Is I2C enabled?")
+            raise
         except Exception as e:
-            logging.error("Failed to initialize sensor: %s", e)
-            sys.exit(1)
+            logger.error(f"Unexpected error initializing I2C bus: {e}")
+            raise
 
-    def read_interrupt(self):
+        # Set up GPIO pins using Broadcom (BCM) numbering
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(IRQ_PIN, GPIO.IN)  # Set the IRQ pin as input
+
+        # Calibration parameters for the noise floor level
+        self.noise_floor_level = 2  # Initial noise floor level (0-7)
+        self.noise_floor_lock = threading.Lock()  # Lock for thread-safe noise floor adjustments
+
+        # Queue to hold interrupt events for processing
+        self.event_queue = queue.Queue()
+
+        # Event to signal the processor thread to exit
+        self.stop_event = threading.Event()
+
+        # Thread to process events from the event queue
+        self.processor_thread = threading.Thread(target=self.process_events, daemon=False)
+
+        # Flag to control the main loop in the run method
+        self.running = True
+
+        # Set up signal handling for graceful shutdown on SIGINT or SIGTERM
+        signal.signal(signal.SIGINT, self.shutdown)
+        signal.signal(signal.SIGTERM, self.shutdown)
+
+        # Variables for interrupt debounce
+        self.last_interrupt_time = datetime.min  # Initialize to the earliest possible datetime
+        self.interrupt_cooldown = timedelta(seconds=INTERRUPT_COOLDOWN_SECONDS)  # Cooldown duration
+
+    def __enter__(self):
         """
-        Read the interrupt register from the sensor.
+        Allows the LightningDetector to be used with the 'with' statement.
 
-        The interrupt register indicates if certain events have occurred, such as lightning detection,
-        noise level too high, or disturber detection.
-
-        :return: The value of the interrupt register, or None if an error occurs.
+        Returns:
+            self: The LightningDetector instance.
         """
-        try:
-            # The interrupt register is located at address 0x03
-            interrupt_register = self.config['sensor'].get('interrupt_register', 0x03)
-            interrupt = self.bus.read_byte_data(self.address, interrupt_register)
-            logging.debug("Interrupt register read: 0x%02X", interrupt)
-            return interrupt
-        except Exception as e:
-            logging.error("Error reading interrupt register: %s", e)
-            return None
+        return self
 
-    def get_distance(self):
+    def __exit__(self, exc_type, exc_val, exc_tb):
         """
-        Read the estimated distance to the lightning source.
+        Ensures resources are cleaned up when exiting the 'with' block.
 
-        The distance estimate is provided by the sensor and indicates how far away the lightning occurred.
-
-        :return: The estimated distance in kilometers, or None if an error occurs or if the distance is out of range.
+        Args:
+            exc_type: Exception type if an exception was raised.
+            exc_val: Exception value.
+            exc_tb: Traceback.
         """
-        try:
-            # The distance estimate is stored in register 0x07
-            distance_register = self.config['sensor'].get('distance_register', 0x07)
-            distance = self.bus.read_byte_data(self.address, distance_register)
-            if distance == 0:
-                # A value of 0 indicates an out-of-range condition or that the distance is not available
-                logging.debug("Distance read as 0 (out of range or unavailable).")
+        self.shutdown(None, None)
+
+    # ----------------------------
+    # Sensor Communication Methods
+    # ----------------------------
+
+    def read_register(self, reg_addr):
+        """
+        Reads a byte from a specified register of the AS3935 sensor.
+
+        Args:
+            reg_addr (int): The register address to read from.
+
+        Returns:
+            int: The value read from the register, or None if an error occurs.
+        """
+        with self.i2c_lock:
+            try:
+                return self.bus.read_byte_data(AS3935_I2C_ADDR, reg_addr)
+            except Exception as e:
+                logger.error(f"I2C read error at register {reg_addr:#04x}: {e}\n{traceback.format_exc()}")
                 return None
+
+    def write_register(self, reg_addr, data):
+        """
+        Writes a byte to a specified register of the AS3935 sensor.
+
+        Args:
+            reg_addr (int): The register address to write to.
+            data (int): The data byte to write.
+        """
+        with self.i2c_lock:
+            try:
+                self.bus.write_byte_data(AS3935_I2C_ADDR, reg_addr, data)
+                logger.debug(f"Wrote {data:#04x} to register {reg_addr:#04x}")
+            except Exception as e:
+                logger.error(f"I2C write error at register {reg_addr:#04x}: {e}\n{traceback.format_exc()}")
+
+    # ----------------------------
+    # Sensor Configuration Methods
+    # ----------------------------
+
+    def configure_sensor(self):
+        """
+        Configures the AS3935 sensor with initial settings.
+        Retries configuration if temporary errors occur.
+
+        This method sets the AFE gain, masks disturbers, and sets the initial noise floor level.
+        """
+        logger.info("Configuring the AS3935 sensor.")
+        retries = 3  # Number of retries for configuration
+        delay = 1    # Initial delay between retries in seconds
+        for attempt in range(retries):
+            try:
+                # Set the AFE gain to indoor mode (can be set to outdoor if needed)
+                self.set_afe_gain(indoor=True)
+
+                # Mask disturber events to reduce false positives
+                self.mask_disturbers(mask=True)
+
+                # Set the initial noise floor level
+                self.set_noise_floor_level(self.noise_floor_level)
+
+                logger.info("Sensor configuration complete.")
+                return
+            except Exception as e:
+                logger.error(f"Sensor configuration failed: {e}\n{traceback.format_exc()}")
+                if attempt < retries - 1:
+                    logger.info(f"Retrying sensor configuration in {delay} seconds...")
+                    time.sleep(delay)
+                    delay *= 2  # Exponential backoff for subsequent retries
+                else:
+                    logger.error("Max retries reached for sensor configuration.")
+                    # Send alerts if configuration fails after retries
+                    self.send_alerts("⚠️ Lightning Detector failed to configure the sensor.")
+                    self.shutdown(None, None)
+
+    def set_afe_gain(self, indoor=True):
+        """
+        Sets the AFE gain for indoor or outdoor use.
+
+        Args:
+            indoor (bool): If True, sets gain for indoor use; otherwise, for outdoor use.
+        """
+        reg_value = self.read_register(REG_AFE_GAIN)
+        if reg_value is not None:
+            if indoor:
+                # Set bits 5 and 6 to '01' for indoor mode
+                reg_value = (reg_value & 0x9F) | 0x20
             else:
-                # Return the distance value in kilometers
-                logging.debug("Distance read: %d km.", distance)
-                return distance
-        except Exception as e:
-            logging.error("Error reading distance register: %s", e)
-            return None
+                # Set bits 5 and 6 to '10' for outdoor mode
+                reg_value = (reg_value & 0x9F) | 0x40
+            self.write_register(REG_AFE_GAIN, reg_value)
+            logger.debug(f"Set AFE gain to {'indoor' if indoor else 'outdoor'} mode.")
+        else:
+            raise Exception("Failed to read AFE_GAIN register.")
 
-# ==============================
-# Notification Functions
-# ==============================
-
-def send_notifications(message, config, slack_client, twilio_client):
-    """
-    Send notifications using the enabled notification methods.
-
-    This function checks which notification methods are enabled in the configuration
-    and calls the appropriate functions to send the message.
-
-    :param message: The message to be sent in the notifications.
-    :param config: Configuration dictionary containing notification settings.
-    :param slack_client: Initialized Slack WebClient or None.
-    :param twilio_client: Initialized Twilio Client or None.
-    """
-    threading_config = config['notifications'].get('threading', {})
-    threading_enabled = threading_config.get('enabled', True)
-    timeout = threading_config.get('timeout', None)
-    threads = []
-
-    if threading_enabled:
-        # Check if Slack notifications are enabled and if the Slack client is initialized
-        if config['notifications']['slack']['enabled'] and slack_client:
-            thread = threading.Thread(target=send_slack_notification, args=(message, config, slack_client))
-            threads.append(thread)
-            thread.start()
-
-        # Check if Twilio SMS notifications are enabled and if the Twilio client is initialized
-        if config['notifications']['twilio']['enabled'] and twilio_client:
-            thread = threading.Thread(target=send_sms_notification, args=(message, config, twilio_client))
-            threads.append(thread)
-            thread.start()
-
-        # Wait for all notification threads to complete with optional timeout
-        for thread in threads:
-            thread.join(timeout=timeout)
-    else:
-        # Send notifications without threading
-        if config['notifications']['slack']['enabled'] and slack_client:
-            send_slack_notification(message, config, slack_client)
-        if config['notifications']['twilio']['enabled'] and twilio_client:
-            send_sms_notification(message, config, twilio_client)
-
-def send_slack_notification(message, config, slack_client):
-    """
-    Send a notification message to a Slack channel.
-
-    :param message: The message to send.
-    :param config: Configuration dictionary containing Slack settings.
-    :param slack_client: Initialized Slack WebClient.
-    """
-    try:
-        response = slack_client.chat_postMessage(
-            channel=config['notifications']['slack']['channel_id'],
-            text=message
-        )
-        logging.info("Slack notification sent: %s", message)
-    except Exception as e:
-        logging.error("Failed to send Slack notification: %s", e)
-
-def send_sms_notification(message, config, twilio_client):
-    """
-    Send an SMS notification via Twilio.
-
-    :param message: The message to send.
-    :param config: Configuration dictionary containing Twilio settings.
-    :param twilio_client: Initialized Twilio Client.
-    """
-    try:
-        sms_message = twilio_client.messages.create(
-            body=message,
-            from_=config['notifications']['twilio']['from_number'],
-            to=config['notifications']['twilio']['to_number']
-        )
-        logging.info("SMS notification sent: SID=%s", sms_message.sid)
-    except Exception as e:
-        logging.error("Failed to send SMS notification: %s", e)
-
-# ==============================
-# Main Execution Function
-# ==============================
-
-def main():
-    """
-    Main function to run the lightning detection system.
-
-    This function initializes the sensor, sets up the GPIO interrupt handling,
-    and enters a loop to keep the program running and responsive to sensor events.
-    """
-    # Load the configuration
-    config = load_config()
-
-    # Configure logging based on the loaded configuration
-    configure_logging(config)
-
-    # Validate the loaded configuration
-    validate_config(config)
-
-    # Initialize notification clients
-    slack_client, twilio_client = initialize_notifications(config)
-
-    # Extract hardware configuration from the configuration file
-    hardware_config = config.get('hardware', {})
-    I2C_BUS = hardware_config.get('i2c_bus')
-    SENSOR_ADDR = hardware_config.get('sensor_address')
-    INTERRUPT_PIN = hardware_config.get('interrupt_pin')
-    gpio_mode = hardware_config.get('gpio_mode', 'BCM')
-
-    # Initialize the I2C bus for communication with the sensor
-    try:
-        bus = SMBus(I2C_BUS)
-        logging.debug("I2C bus %d initialized.", I2C_BUS)
-    except Exception as e:
-        logging.error("Failed to initialize I2C bus %d: %s", I2C_BUS, e)
-        sys.exit(1)
-
-    # Create an instance of the LightningSensor class
-    sensor = LightningSensor(bus, SENSOR_ADDR, config)
-
-    # Retrieve sensor configuration with defaults
-    sensor_config = config.get('sensor', {})
-    noise_floor = sensor_config.get('noise_floor')
-    watchdog_threshold = sensor_config.get('watchdog_threshold')
-
-    # Retrieve timing configurations
-    timing_config = config.get('timing', {})
-    sensor_reset_delay = timing_config.get('sensor_reset_delay', 0.1)
-    interrupt_handling_delay = timing_config.get('interrupt_handling_delay', 0.003)
-    main_loop_sleep_duration = timing_config.get('main_loop_sleep_duration', 1)
-    gpio_bouncetime = timing_config.get('gpio_bouncetime', 500)  # In milliseconds
-
-    # Call the setup method to initialize the sensor with the desired settings
-    sensor.setup(noise_floor, watchdog_threshold, reset_delay=sensor_reset_delay)
-
-    # Initialize the GPIO library to control the Raspberry Pi's GPIO pins
-    if gpio_mode.upper() == 'BCM':
-        GPIO.setmode(GPIO.BCM)  # Use BCM numbering (GPIO pin numbers)
-    elif gpio_mode.upper() == 'BOARD':
-        GPIO.setmode(GPIO.BOARD)  # Use BOARD numbering (physical pin numbers)
-    else:
-        logging.error("Invalid GPIO mode '%s' specified in configuration.", gpio_mode)
-        sys.exit(1)
-    logging.debug("GPIO mode set to %s.", gpio_mode.upper())
-
-    # Set up the interrupt pin as an input with a pull-down resistor
-    GPIO.setup(INTERRUPT_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
-    logging.debug("Interrupt pin %d set as input with pull-down resistor.", INTERRUPT_PIN)
-
-    # Define a function to handle interrupts from the sensor
-    def handle_interrupt(channel):
+    def mask_disturbers(self, mask=True):
         """
-        Callback function to handle sensor interrupts.
+        Masks or unmasks disturber events to reduce false positives.
 
-        This function is called when the sensor triggers an interrupt, indicating that an event has occurred.
-
-        :param channel: The GPIO channel (pin number) that triggered the interrupt.
+        Args:
+            mask (bool): If True, masks disturber events; otherwise, unmasks them.
         """
-        logging.debug("Interrupt detected on channel %d.", channel)
-        # Wait for the specified interrupt handling delay
-        time.sleep(interrupt_handling_delay)
+        reg_value = self.read_register(REG_INT_MASK_ANT)
+        if reg_value is not None:
+            if mask:
+                reg_value |= MASK_DISTURBER  # Set the mask disturber bit
+                logger.debug("Masking disturbers.")
+            else:
+                reg_value &= ~MASK_DISTURBER  # Clear the mask disturber bit
+                logger.debug("Unmasking disturbers.")
+            self.write_register(REG_INT_MASK_ANT, reg_value)
+        else:
+            raise Exception("Failed to read INT_MASK_ANT register.")
 
-        # Read the interrupt register from the sensor
-        interrupt = sensor.read_interrupt()
-        if interrupt is None:
-            # If reading the interrupt register failed, we cannot proceed
-            logging.warning("Interrupt register read failed.")
+    def set_noise_floor_level(self, level):
+        """
+        Sets the noise floor level to filter out background noise.
+
+        Args:
+            level (int): The noise floor level (0-7).
+
+        Raises:
+            Exception: If the noise floor register cannot be read.
+        """
+        if 0 <= level <= 7:
+            reg_value = self.read_register(REG_NOISE_FLOOR)
+            if reg_value is not None:
+                # Clear the lower 3 bits and set the new noise floor level
+                reg_value = (reg_value & 0xF8) | level
+                self.write_register(REG_NOISE_FLOOR, reg_value)
+                logger.debug(f"Noise floor level set to {level}.")
+            else:
+                raise Exception("Failed to read NOISE_FLOOR register.")
+        else:
+            logger.warning("Invalid noise floor level. Must be between 0 and 7.")
+
+    # ----------------------------
+    # Interrupt Handling Methods
+    # ----------------------------
+
+    def handle_interrupt(self, channel):
+        """
+        Interrupt handler for the AS3935 sensor.
+        Implements debounce to prevent multiple rapid interrupts.
+
+        Args:
+            channel (int): The GPIO channel that triggered the interrupt.
+        """
+        with self.interrupt_lock:
+            now = datetime.now()
+            if now - self.last_interrupt_time > self.interrupt_cooldown:
+                # If enough time has passed since the last interrupt, queue the event
+                self.event_queue.put('interrupt')
+                self.last_interrupt_time = now
+                logger.debug("Interrupt queued for processing.")
+            else:
+                logger.debug("Interrupt received but ignored due to cooldown.")
+
+    # ----------------------------
+    # Event Processing Methods
+    # ----------------------------
+
+    def process_events(self):
+        """
+        Processes events from the event queue.
+        This method runs in a separate thread and handles interrupts and other events.
+        """
+        while not self.stop_event.is_set():
+            try:
+                # Wait for an event with a longer timeout to reduce CPU usage
+                event = self.event_queue.get(timeout=1.0)
+                if event == 'interrupt':
+                    self.process_interrupt()
+            except queue.Empty:
+                # If the queue is empty, continue the loop
+                continue
+            except Exception as e:
+                logger.error(f"Unexpected error in event processing: {e}\n{traceback.format_exc()}")
+
+    def process_interrupt(self):
+        """
+        Processes the interrupt by reading the interrupt source from the sensor.
+        Determines the type of event (lightning, disturber, noise) and takes appropriate action.
+        """
+        int_source = self.read_register(REG_INT)
+        if int_source is None:
+            logger.error("Failed to read interrupt source.")
             return
 
-        # Retrieve interrupt bit masks from configuration
-        sensor_bits = config['sensor']
-        noise_level_bit = sensor_bits.get('noise_level_bit', 0x01)
-        disturber_bit = sensor_bits.get('disturber_bit', 0x04)
-        lightning_bit = sensor_bits.get('lightning_bit', 0x08)
-
-        # Retrieve message templates from configuration
-        message_templates = config['notifications'].get('message_templates', {})
-        lightning_message_template = message_templates.get(
-            'lightning_detected',
-            "⚡ Lightning detected approximately {distance} km away!"
-        )
-        noise_message_template = message_templates.get(
-            'noise_too_high',
-            "Warning: Noise level too high."
-        )
-        disturber_message_template = message_templates.get(
-            'disturber_detected',
-            "Info: Disturber detected (false event)."
-        )
-
-        # Interpret the interrupt register value to determine the type of event
-        if interrupt & noise_level_bit:
-            # Noise level too high
-            logging.warning("Noise level too high - consider adjusting the noise floor setting.")
-            message = noise_message_template
-            send_notifications(message, config, slack_client, twilio_client)
-        elif interrupt & disturber_bit:
-            # Disturber detected
-            logging.info("Disturber detected - false event.")
-            message = disturber_message_template
-            send_notifications(message, config, slack_client, twilio_client)
-        elif interrupt & lightning_bit:
+        # Check which type of event has occurred based on interrupt source bits
+        if int_source & MASK_LIGHTNING:
             # Lightning detected
-            distance = sensor.get_distance()
+            distance = self.read_register(REG_LIGHTNING_DISTANCE)
             if distance is not None:
-                logging.info("Lightning detected at approximately %d km away.", distance)
-                # Check if the distance is within the user-defined alert threshold
-                alert_threshold = config['user_settings'].get('alert_threshold')
-                if distance <= alert_threshold:
-                    # Prepare the notification message with the distance information
-                    message = lightning_message_template.format(distance=distance)
-                    # Send notifications using the enabled methods
-                    send_notifications(message, config, slack_client, twilio_client)
+                distance_km = distance & 0x3F  # Lower 6 bits represent distance in km
+                message = f"⚡ Lightning detected! Estimated distance: {distance_km} km."
+                logger.info("Lightning event detected.")
+                # Send alerts via Slack and SMS
+                self.send_alerts(message)
             else:
-                logging.info("Lightning detected, but distance is unknown.")
-                message = "⚡ Lightning detected, but distance is unknown."
-                send_notifications(message, config, slack_client, twilio_client)
+                logger.error("Failed to read lightning distance.")
+        elif int_source & MASK_DISTURBER_EVENT:
+            # Disturber (false event) detected
+            logger.info("Disturber detected. Adjusting settings.")
+            # Optionally adjust settings to reduce sensitivity
+            self.adjust_noise_floor(increase=True)
+        elif int_source & MASK_NOISE_HIGH:
+            # Noise level too high
+            logger.warning("Noise level too high. Adjusting noise floor level.")
+            self.adjust_noise_floor(increase=True)
+        else:
+            # Unexpected interrupt source
+            logger.warning(f"Unexpected interrupt source: {int_source:#04x}")
 
-    # Set up event detection on the interrupt pin
-    # Monitor for rising edges (low to high transitions)
-    # The 'bouncetime' parameter helps to prevent multiple triggers due to signal bouncing
-    GPIO.add_event_detect(
-        INTERRUPT_PIN,
-        GPIO.RISING,
-        callback=handle_interrupt,
-        bouncetime=gpio_bouncetime
-    )
-    logging.debug("Event detection set up on interrupt pin %d with bouncetime %d ms.", INTERRUPT_PIN, gpio_bouncetime)
+    def adjust_noise_floor(self, increase=True):
+        """
+        Adjusts the noise floor level up or down based on sensor feedback.
+        This helps filter out background noise or false events.
 
-    # Use a threading event to handle program termination gracefully
-    stop_event = threading.Event()
+        Args:
+            increase (bool): If True, increases the noise floor level; otherwise, decreases it.
+        """
+        with self.noise_floor_lock:
+            if increase and self.noise_floor_level < 7:
+                self.noise_floor_level += 1
+                self.set_noise_floor_level(self.noise_floor_level)
+                logger.info(f"Increased noise floor level to {self.noise_floor_level}.")
+            elif not increase and self.noise_floor_level > 0:
+                self.noise_floor_level -= 1
+                self.set_noise_floor_level(self.noise_floor_level)
+                logger.info(f"Decreased noise floor level to {self.noise_floor_level}.")
+            else:
+                logger.warning("Noise floor level is at its limit.")
 
-    # Retrieve main loop execution interval from configuration
-    main_loop_config = config.get('main_loop', {})
-    execution_interval = main_loop_config.get('execution_interval', main_loop_sleep_duration)
+    # ----------------------------
+    # Alert Sending Methods
+    # ----------------------------
 
-    # Use a try-except-finally block to manage the program's execution and cleanup
-    try:
-        # Log that the lightning detection system has started
-        logging.info("Lightning detection system started.")
-        # Enter the main loop to keep the program running
-        while not stop_event.is_set():
-            # You can perform other tasks here if needed
-            # For now, we just sleep for the specified execution interval
-            time.sleep(execution_interval)
-    except KeyboardInterrupt:
-        # If the user presses Ctrl+C, a KeyboardInterrupt exception is raised
-        logging.info("Program terminated by user.")
-        # Set the stop_event to exit the main loop
-        stop_event.set()
-    finally:
-        # Perform cleanup actions to release resources
-        GPIO.cleanup()  # Reset the GPIO pins to a safe state
-        bus.close()     # Close the I2C bus
-        logging.info("Resources cleaned up, exiting program.")
+    def send_alerts(self, message):
+        """
+        Sends alerts via Slack and Twilio SMS.
+        Implements retries with exponential backoff in case of temporary failures.
 
-# ==============================
+        Args:
+            message (str): The message to send in the alerts.
+        """
+        max_retries = 3  # Maximum number of retries for sending alerts
+        delay = 1        # Initial delay between retries in seconds
+
+        # Send Slack message
+        for attempt in range(max_retries):
+            try:
+                response = slack_client.chat_postMessage(channel=SLACK_CHANNEL, text=message)
+                logger.info(f"Slack alert sent: {response['ts']}")
+                break  # Break out of the loop if successful
+            except SlackApiError as e:
+                logger.error(f"Slack API error: {e.response['error']}\n{traceback.format_exc()}")
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying Slack message in {delay} seconds...")
+                    time.sleep(delay)
+                    delay *= 2  # Exponential backoff
+                else:
+                    logger.error("Max retries reached for Slack message.")
+
+        # Reset delay for Twilio retries
+        delay = 1
+
+        # Send SMS via Twilio
+        for attempt in range(max_retries):
+            try:
+                message_obj = twilio_client.messages.create(
+                    body=message,
+                    from_=TWILIO_FROM_NUMBER,
+                    to=TWILIO_TO_NUMBER
+                )
+                logger.info(f"SMS alert sent: SID {message_obj.sid}")
+                break  # Break out of the loop if successful
+            except TwilioRestException as e:
+                logger.error(f"Twilio error: {e.msg}\n{traceback.format_exc()}")
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying SMS message in {delay} seconds...")
+                    time.sleep(delay)
+                    delay *= 2  # Exponential backoff
+                else:
+                    logger.error("Max retries reached for SMS message.")
+
+    # ----------------------------
+    # Periodic Sensor Check Method
+    # ----------------------------
+
+    def periodic_sensor_check(self):
+        """
+        Periodically checks the sensor status to ensure it's functioning correctly.
+        This method can detect if the sensor has become unresponsive and take corrective action.
+        """
+        logger.debug("Performing periodic sensor check.")
+        try:
+            with self.i2c_lock:
+                # Example: Read a register that should have a constant value
+                reg_value = self.read_register(REG_INT_MASK_ANT)
+            if reg_value is None:
+                logger.error("Sensor check failed: Unable to read INT_MASK_ANT register.")
+                # Handle sensor error, possibly reinitialize the sensor
+            else:
+                logger.debug("Sensor check passed.")
+        except Exception as e:
+            logger.error(f"Error during sensor check: {e}\n{traceback.format_exc()}")
+
+    # ----------------------------
+    # Shutdown and Cleanup Methods
+    # ----------------------------
+
+    def shutdown(self, signum, frame):
+        """
+        Handles shutdown signals to clean up resources.
+        This method is called when a SIGINT or SIGTERM signal is received.
+
+        Args:
+            signum (int): The signal number.
+            frame: The current stack frame (unused).
+        """
+        logger.info("Shutdown signal received. Cleaning up.")
+        self.running = False         # Stop the main loop in the run method
+        self.stop_event.set()        # Signal the processor thread to exit
+        try:
+            if GPIO.event_detected(IRQ_PIN):
+                GPIO.remove_event_detect(IRQ_PIN)  # Remove the interrupt detection
+            GPIO.cleanup()                     # Clean up GPIO resources
+            logger.debug("GPIO cleanup completed.")
+        except Exception as e:
+            logger.error(f"Error during GPIO cleanup: {e}\n{traceback.format_exc()}")
+
+        if hasattr(self, 'bus'):
+            try:
+                self.bus.close()  # Close the I2C bus
+                logger.debug("I2C bus closed.")
+            except Exception as e:
+                logger.error(f"Error closing I2C bus: {e}\n{traceback.format_exc()}")
+
+        if self.processor_thread.is_alive():
+            self.processor_thread.join()  # Wait for the processor thread to finish
+            logger.debug("Processor thread joined.")
+
+        logger.info("Cleanup complete. Exiting.")
+        # Exit the program
+        exit(0)
+
+    # ----------------------------
+    # Main Execution Method
+    # ----------------------------
+
+    def run(self):
+        """
+        Main loop to keep the script running.
+        This method configures the sensor, starts the processor thread, and enters a loop
+        that periodically checks the sensor status.
+        """
+        self.configure_sensor()
+        logger.info("Waiting for lightning strikes...")
+
+        # Start the processor thread to handle events
+        self.processor_thread.start()
+
+        try:
+            while self.running:
+                # Periodically check the sensor every 5 seconds
+                self.periodic_sensor_check()
+                time.sleep(5)
+        except KeyboardInterrupt:
+            # Handle Ctrl+C interrupt
+            self.shutdown(None, None)
+        finally:
+            if self.processor_thread.is_alive():
+                self.processor_thread.join()  # Ensure the processor thread is cleaned up
+
+# ----------------------------
 # Script Entry Point
-# ==============================
+# ----------------------------
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    try:
+        # Use context manager to ensure resources are cleaned up
+        with LightningDetector() as detector:
+            # Register the interrupt handler after initializing the detector
+            try:
+                GPIO.add_event_detect(IRQ_PIN, GPIO.RISING, callback=detector.handle_interrupt)
+                logger.debug("GPIO event detection registered.")
+            except Exception as e:
+                logger.error(f"Failed to register GPIO event detect: {e}\n{traceback.format_exc()}")
+                detector.shutdown(None, None)
+
+            # Run the main loop
+            detector.run()
+
+    except Exception as e:
+        logger.error(f"Failed to initialize LightningDetector: {e}\n{traceback.format_exc()}")
+        exit(1)
