@@ -159,7 +159,7 @@ pip3 install smbus2 RPi.GPIO slack_sdk twilio
 ### Step 4: Download Project Code
 
 ```bash
-git clone https://github.com/yourusername/lightning-detector.git
+git clone https://github.com/morroware/Lightning-Detector.git
 cd lightning-detector
 ```
 
